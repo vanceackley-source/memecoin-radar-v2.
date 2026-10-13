@@ -1,5 +1,7 @@
 {
   "seen": {
+    "d72743d86d0ad9b733c67504": 1791882433.97492,
+    "b99ea3fb874b64e46e18bdd9": 1791882433.97492,
     "82c3928527dd605da9b9669f": 1791857081.584559
   },
   "topics": [
@@ -20,6 +22,39 @@
         "year"
       ],
       "ts": 1791857081.584559
+    },
+    {
+      "words": [
+        "bigearthdata",
+        "hogle",
+        "monkeys",
+        "spider",
+        "takes",
+        "trafficking",
+        "wildlife"
+      ],
+      "ts": 1791882433.97492
+    },
+    {
+      "words": [
+        "allegedly",
+        "animalvictory",
+        "deserved",
+        "disturbing",
+        "ground",
+        "innocent",
+        "justiceforcats",
+        "leaving",
+        "paralyzed",
+        "petition",
+        "safety",
+        "shows",
+        "sign",
+        "slamming",
+        "violence",
+        "woman"
+      ],
+      "ts": 1791882433.97492
     }
   ]
 }
