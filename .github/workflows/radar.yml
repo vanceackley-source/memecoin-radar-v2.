@@ -1,0 +1,54 @@
+name: Memecoin Narrative Radar V2
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub may delay or skip runs when busy.
+    - cron: '2/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: 'Send a test message to Discord?'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # Needed only to save de-duplication state.json
+
+concurrency:
+  group: narrative-radar
+  cancel-in-progress: false
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Check out source and state
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Use Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Scan free feeds and notify Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          TEST_ALERT: ${{ inputs.test_alert && '1' || '0' }}
+          MIN_SCORE: '8'
+          MAX_AGE_HOURS: '12'
+          MAX_ALERTS: '3'
+        run: python scanner.py
+      - name: Persist deduplication state
+        if: ${{ !inputs.test_alert }}
+        run: |
+          if [ -f state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: update radar seen-story history [skip ci]"
+              git push
+            fi
+          fi
