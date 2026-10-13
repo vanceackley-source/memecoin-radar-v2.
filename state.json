@@ -1,5 +1,6 @@
 {
   "seen": {
+    "df714039f81736dad353cb92": 1791927313.485717,
     "d72743d86d0ad9b733c67504": 1791882433.97492,
     "b99ea3fb874b64e46e18bdd9": 1791882433.97492,
     "82c3928527dd605da9b9669f": 1791857081.584559
@@ -55,6 +56,26 @@
         "woman"
       ],
       "ts": 1791882433.97492
+    },
+    {
+      "words": [
+        "abuse",
+        "around",
+        "called",
+        "clip",
+        "fans",
+        "heavy",
+        "here",
+        "hitting",
+        "jake",
+        "large",
+        "paul",
+        "reaction",
+        "shows",
+        "snake",
+        "wrapped"
+      ],
+      "ts": 1791927313.485717
     }
   ]
 }
