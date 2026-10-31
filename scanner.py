@@ -37,6 +37,18 @@ STOP_LOSS_PCT = int(os.getenv('STOP_LOSS_PCT', '30'))
 TAKE_PROFIT_PCT = int(os.getenv('TAKE_PROFIT_PCT', '50'))
 MAX_LOOKUPS = int(os.getenv('MAX_LOOKUPS', '8'))             # coin lookups per scan (API politeness)
 
+# --- X (Twitter) via twitterapi.io (optional; skipped if no key) ---
+X_API_KEY = os.getenv('X_API_KEY', '').strip()
+X_INTERVAL_MIN = int(os.getenv('X_INTERVAL_MIN', '15'))      # how often to spend credits on X
+X_MIN_LIKES = int(os.getenv('X_MIN_LIKES', '300'))           # viral-event posts
+X_BUZZ_MIN_FOLLOWERS = int(os.getenv('X_BUZZ_MIN_FOLLOWERS', '10000'))
+X_EVENT_QUERY = os.getenv('X_EVENT_QUERY',
+    '(viral OR breaking OR "just in" OR rescued OR named) (animal OR monkey OR penguin OR dog OR cat OR AI OR robot OR meme) '
+    'min_faves:{likes} -filter:replies -filter:retweets lang:en within_time:1h')
+X_BUZZ_QUERY = os.getenv('X_BUZZ_QUERY',
+    '(solana OR pump.fun OR pumpfun OR memecoin) min_faves:50 -filter:retweets lang:en within_time:1h')
+IGNORE_TICKERS = {'SOL', 'BTC', 'ETH', 'USDC', 'USDT', 'BNB', 'XRP', 'JUP', 'PUMP', 'WIF', 'BONK', 'TRUMP', 'SPX'}
+
 # Focused queries, not broad words like "AI" or "meme" that cause junk alerts.
 BSKY_QUERIES = [
     'baby animal rescued', 'monkey rescued', 'zoo newborn named',
@@ -77,7 +89,10 @@ def parse_iso(value):
         try:
             return parsedate_to_datetime(value).astimezone(timezone.utc)
         except (ValueError, TypeError, IndexError):
-            return None
+            try:
+                return datetime.strptime(value, '%a %b %d %H:%M:%S %z %Y').astimezone(timezone.utc)
+            except (ValueError, TypeError):
+                return None
 
 
 def normalize(s):
@@ -123,6 +138,55 @@ def fetch_news():
         except (urllib.error.URLError, ET.ParseError, TimeoutError, OSError) as exc:
             print('Google News unavailable for', repr(query), ':', str(exc)[:100])
     return results
+
+
+def x_search(query):
+    qs = urllib.parse.urlencode({'query': query, 'queryType': 'Latest'})
+    req = urllib.request.Request('https://api.twitterapi.io/twitter/tweet/advanced_search?' + qs,
+                                 headers={'X-API-Key': X_API_KEY, 'User-Agent': USER_AGENT})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read()).get('tweets') or []
+
+
+def fetch_x_events():
+    """Viral real-world posts on X, fed into the same story filter as news."""
+    out = []
+    try:
+        for t in x_search(X_EVENT_QUERY.format(likes=X_MIN_LIKES)):
+            text = normalize(t.get('text', ''))
+            a = t.get('author') or {}
+            if not text or not t.get('url'):
+                continue
+            out.append({'title': text, 'url': t['url'], 'source': 'X (@' + a.get('userName', '?') + ')',
+                        'date': parse_iso(t.get('createdAt')),
+                        'likes': int(t.get('likeCount') or 0), 'reposts': int(t.get('retweetCount') or 0)})
+    except (urllib.error.URLError, ValueError, TimeoutError, OSError) as exc:
+        print('X events unavailable:', str(exc)[:120])
+    return out
+
+
+def fetch_x_buzz():
+    """$TICKERS that bigger crypto accounts are posting about right now."""
+    buzz = {}
+    try:
+        tweets = x_search(X_BUZZ_QUERY)
+    except (urllib.error.URLError, ValueError, TimeoutError, OSError) as exc:
+        print('X buzz unavailable:', str(exc)[:120]); return []
+    for t in tweets:
+        a = t.get('author') or {}
+        followers = int(a.get('followers') or 0)
+        if followers < X_BUZZ_MIN_FOLLOWERS or a.get('isAutomated'):
+            continue
+        for tk in set(m.upper() for m in re.findall(r'\$([A-Za-z][A-Za-z0-9]{1,9})\b', t.get('text', ''))):
+            if tk in IGNORE_TICKERS:
+                continue
+            b = buzz.setdefault(tk, {'ticker': tk, 'accounts': set(), 'reach': 0, 'likes': 0, 'url': t.get('url')})
+            if a.get('userName') not in b['accounts']:
+                b['accounts'].add(a.get('userName')); b['reach'] += followers
+            b['likes'] += int(t.get('likeCount') or 0)
+    # Worth a look: 2+ separate accounts, or one big account (50k+).
+    hot = [b for b in buzz.values() if len(b['accounts']) >= 2 or b['reach'] >= 50000]
+    return sorted(hot, key=lambda b: (len(b['accounts']), b['reach']), reverse=True)
 
 
 def is_recent(dt):
@@ -334,13 +398,22 @@ def alert(item, analysis, coin):
     discord(payload)
 
 
+def alert_buzz(b, coin):
+    names = ', '.join('@' + n for n in sorted(b['accounts'])[:5])
+    item = {'title': f"${b['ticker']} is getting buzz on X", 'url': b['url'] or coin['url'], 'source': 'X: ' + names,
+            'date': NOW, 'reach': b['reach']}
+    analysis = {'category': 'X buzz', 'score': len(b['accounts'])}
+    alert(item, analysis, coin)
+
+
 def explain(item, analysis):
     category = analysis['category']
     return {'Animal story': 'A specific real-world animal event can give a coin a recognizable story.',
             'Viral animal': 'An unusual animal story is already being shared online.',
             'AI trend': 'An AI-related event or character could spark a distinct online meme.',
             'Meme trend': 'A recognizable meme or trend may inspire a community nickname.',
-            'Unusual news': 'An unexpected event with a clear hook could become a meme.'}[category]
+            'Unusual news': 'An unexpected event with a clear hook could become a meme.',
+            'X buzz': 'Several crypto accounts on X (combined reach ' + f"{item.get('reach', 0):,}" + ') started posting this ticker in the last hour.'}[category]
 
 
 def load_state():
@@ -362,6 +435,13 @@ def scan():
     if not WEBHOOK.startswith(('https://discord.com/api/webhooks/', 'https://discordapp.com/api/webhooks/')):
         raise RuntimeError('DISCORD_WEBHOOK is not set. Add the repository secret.')
     fetched = fetch_bluesky() + fetch_news()
+    old_peek = load_state() or {}
+    x_due = bool(X_API_KEY) and NOW.timestamp() - float(old_peek.get('last_x', 0) or 0) >= X_INTERVAL_MIN * 60 - 30
+    x_buzz = []
+    if x_due:
+        fetched += fetch_x_events()
+        x_buzz = fetch_x_buzz()
+        print('X scanned:', len(x_buzz), 'hot tickers')
     if not fetched:
         print('No feeds reachable; keeping state unchanged so next scan can retry.'); return
     old = load_state()
@@ -417,13 +497,33 @@ def scan():
             # Don't mark failed alerts as sent; URL can retry next run.
             seen.pop(ident(item['url']), None)
             print('Alert failed:', str(exc)[:140])
+    # X ticker buzz (skip tickers already alerted in the last 24h).
+    x_seen = {k: v for k, v in ((old or {}).get('x_tickers') or {}).items() if isinstance(v, (int, float)) and v >= cutoff}
+    for b in x_buzz:
+        if virgin or sent >= MAX_ALERTS or lookups >= MAX_LOOKUPS: break
+        if b['ticker'] in x_seen or b['ticker'] in checked_tickers: continue
+        lookups += 1
+        coin, notes = check_ticker(b['ticker'])
+        checked_tickers[b['ticker']] = (coin, notes)
+        if not coin:
+            skipped += 1
+            print('X buzz $' + b['ticker'] + ' skipped:', ' | '.join(notes)[:300])
+            continue
+        try:
+            alert_buzz(b, coin)
+            x_seen[b['ticker']] = NOW.timestamp(); sent += 1
+            print('X buzz alert sent: $' + b['ticker'])
+        except Exception as exc:
+            print('X buzz alert failed:', str(exc)[:140])
     # On a first run, index existing stories but don't send old backlog.
     if virgin:
         print('First run: learned', len(this_batch), 'existing posts; no old alerts sent.')
         recent_topics.extend({'words': sig, 'ts': NOW.timestamp()} for sig in picked[:50])
     # Limit stored hashes so a frequently scheduled public repo stays small.
     seen = dict(sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:1500])
-    STATE_PATH.write_text(json.dumps({'seen': seen, 'topics': recent_topics[-150:]}, indent=2), encoding='utf-8')
+    last_x = NOW.timestamp() if x_due else (old or {}).get('last_x', 0)
+    STATE_PATH.write_text(json.dumps({'seen': seen, 'topics': recent_topics[-150:], 'last_x': last_x,
+                                      'x_tickers': x_seen}, indent=2), encoding='utf-8')
     print('Scan complete. Sources:', len(fetched), 'Candidates:', len(pending), 'Coin lookups:', lookups, 'Unsafe/none skipped:', skipped, 'Alerts:', sent)
 
 
