@@ -24,7 +24,18 @@ NOW = datetime.now(timezone.utc)
 MAX_AGE_HOURS = max(1, min(48, int(os.getenv('MAX_AGE_HOURS', '12'))))
 MIN_SCORE = max(4, min(20, int(os.getenv('MIN_SCORE', '8'))))
 MAX_ALERTS = max(1, min(10, int(os.getenv('MAX_ALERTS', '3'))))
-USER_AGENT = 'Mozilla/5.0 (compatible; NarrativeRadarV2/2.0; public feeds)'
+USER_AGENT = 'Mozilla/5.0 (compatible; NarrativeRadarV2/2.1; public feeds)'
+
+# --- Coin safety settings (override in radar.yml) ---
+MIN_LIQ_USD = float(os.getenv('MIN_LIQ_USD', '15000'))      # pool must hold at least this much
+MIN_VOL_24H = float(os.getenv('MIN_VOL_24H', '25000'))      # real trading activity
+MIN_TXNS_24H = int(os.getenv('MIN_TXNS_24H', '150'))         # buys + sells in 24h
+MIN_AGE_MIN = int(os.getenv('MIN_AGE_MIN', '20'))            # skip coins launched seconds ago
+MAX_TOP10_PCT = float(os.getenv('MAX_TOP10_PCT', '30'))      # top 10 wallets (excl. pool) may own at most this %
+MIN_LP_LOCKED_PCT = float(os.getenv('MIN_LP_LOCKED_PCT', '90'))
+STOP_LOSS_PCT = int(os.getenv('STOP_LOSS_PCT', '30'))
+TAKE_PROFIT_PCT = int(os.getenv('TAKE_PROFIT_PCT', '50'))
+MAX_LOOKUPS = int(os.getenv('MAX_LOOKUPS', '8'))             # coin lookups per scan (API politeness)
 
 # Focused queries, not broad words like "AI" or "meme" that cause junk alerts.
 BSKY_QUERIES = [
@@ -183,6 +194,94 @@ def ident(url):
     return hashlib.sha256(url.encode()).hexdigest()[:24]
 
 
+def get_json(url):
+    return json.loads(request_bytes(url))
+
+
+def find_coins(ticker):
+    """Real Solana tokens whose symbol matches the ticker idea, best liquidity first."""
+    try:
+        data = get_json('https://api.dexscreener.com/latest/dex/search?q=' + urllib.parse.quote(ticker))
+    except (urllib.error.URLError, ValueError, TimeoutError, OSError) as exc:
+        print('DexScreener unavailable for', ticker, ':', str(exc)[:100]); return []
+    best = {}
+    for p in data.get('pairs') or []:
+        base = p.get('baseToken') or {}
+        sym = (base.get('symbol') or '').upper().lstrip('$')
+        if p.get('chainId') != 'solana' or sym != ticker.upper():
+            continue
+        addr = base.get('address')
+        liq = float((p.get('liquidity') or {}).get('usd') or 0)
+        if addr and (addr not in best or liq > best[addr]['liq']):
+            tx = (p.get('txns') or {}).get('h24') or {}
+            best[addr] = {'address': addr, 'name': base.get('name') or sym, 'symbol': sym,
+                          'liq': liq, 'vol24': float((p.get('volume') or {}).get('h24') or 0),
+                          'txns24': int(tx.get('buys') or 0) + int(tx.get('sells') or 0),
+                          'buys24': int(tx.get('buys') or 0), 'sells24': int(tx.get('sells') or 0),
+                          'price': p.get('priceUsd'), 'mcap': p.get('marketCap') or p.get('fdv'),
+                          'change1h': (p.get('priceChange') or {}).get('h1'),
+                          'created': p.get('pairCreatedAt'), 'url': p.get('url'),
+                          'pool': p.get('pairAddress')}
+    return sorted(best.values(), key=lambda c: c['liq'], reverse=True)[:3]
+
+
+def market_problems(c):
+    probs = []
+    if c['liq'] < MIN_LIQ_USD: probs.append(f"low liquidity (${c['liq']:,.0f})")
+    if c['vol24'] < MIN_VOL_24H: probs.append(f"low volume (${c['vol24']:,.0f}/24h)")
+    if c['txns24'] < MIN_TXNS_24H: probs.append(f"few trades ({c['txns24']}/24h)")
+    if c['created']:
+        age_min = (NOW.timestamp() * 1000 - c['created']) / 60000
+        c['age_min'] = age_min
+        if age_min < MIN_AGE_MIN: probs.append(f"launched {age_min:.0f} min ago")
+    if c['sells24'] and c['buys24'] < c['sells24'] * 0.5: probs.append('heavy selling')
+    return probs
+
+
+def rug_problems(c):
+    """RugCheck report: authorities, danger risks, holder concentration, LP lock."""
+    try:
+        r = get_json(f"https://api.rugcheck.xyz/v1/tokens/{c['address']}/report")
+    except (urllib.error.URLError, ValueError, TimeoutError, OSError) as exc:
+        return ['safety report unavailable (' + str(exc)[:40] + ')']
+    probs = []
+    if r.get('rugged'): probs.append('flagged as RUGGED')
+    if r.get('mintAuthority'): probs.append('creator can mint more coins')
+    if r.get('freezeAuthority'): probs.append('creator can freeze wallets')
+    dangers = [x.get('name', '?') for x in (r.get('risks') or []) if x.get('level') == 'danger']
+    if dangers: probs.append('RugCheck danger: ' + ', '.join(dangers[:3]))
+    pools = {c.get('pool')}
+    for m in r.get('markets') or []:
+        pools.add(m.get('pubkey')); lp = m.get('lp') or {}
+        pools.add(lp.get('lpMint'))
+    holders = [h for h in (r.get('topHolders') or []) if h.get('owner') not in pools and h.get('address') not in pools]
+    top10 = sum(float(h.get('pct') or 0) for h in holders[:10])
+    c['top10'] = top10
+    if top10 > MAX_TOP10_PCT: probs.append(f'top 10 wallets own {top10:.0f}%')
+    if any(h.get('insider') for h in holders[:10]): probs.append('insider wallets in top holders')
+    locked = [float((m.get('lp') or {}).get('lpLockedPct') or 0) for m in (r.get('markets') or [])]
+    c['lp_locked'] = max(locked) if locked else None
+    if locked and max(locked) < MIN_LP_LOCKED_PCT: probs.append(f'liquidity only {max(locked):.0f}% locked')
+    c['rug_score'] = r.get('score_normalised')
+    return probs
+
+
+def check_ticker(ticker):
+    """Return (safe_coin, notes). safe_coin is None if nothing passes."""
+    coins = find_coins(ticker)
+    if not coins:
+        return None, ['no real coin trading under this ticker']
+    notes = []
+    for c in coins:
+        probs = market_problems(c)
+        if not probs:
+            probs = rug_problems(c)
+        if not probs:
+            return c, notes
+        notes.append(c['address'][:6] + '…: ' + '; '.join(probs))
+    return None, notes
+
+
 def discord(payload):
     if not WEBHOOK.startswith(('https://discord.com/api/webhooks/', 'https://discordapp.com/api/webhooks/')):
         raise RuntimeError('Missing or invalid DISCORD_WEBHOOK secret. Set it in GitHub Settings > Secrets and variables > Actions.')
@@ -199,18 +298,39 @@ def discord(payload):
             raise RuntimeError('Discord rejected message: HTTP ' + str(exc.code)) from exc
 
 
-def alert(item, analysis):
-    title = item['title'][:230]
+def fmt_usd(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return '?'
+    return f'${v/1e6:.2f}M' if v >= 1e6 else (f'${v/1e3:.0f}K' if v >= 1e3 else f'${v:,.0f}')
+
+
+def alert(item, analysis, coin):
+    title = item['title'][:200]
+    age = coin.get('age_min')
+    age_txt = (f"{age/60:.1f}h" if age and age >= 60 else (f"{age:.0f}m" if age else '?'))
+    lp = coin.get('lp_locked')
+    lp_txt = f" · Liquidity locked: {lp:.0f}%" if lp is not None else ''
+    desc = (
+        f"**Coin:** {coin['name']} (`${coin['symbol']}`)\n"
+        f"**Contract:** `{coin['address']}`\n"
+        f"**Price:** ${coin['price']} · **Market cap:** {fmt_usd(coin['mcap'])} · **Age:** {age_txt}\n"
+        f"**Liquidity:** {fmt_usd(coin['liq'])} · **24h volume:** {fmt_usd(coin['vol24'])} · **24h trades:** {coin['txns24']}\n\n"
+        "**✅ Safety checks passed**\n"
+        "• Creator can't mint more coins or freeze wallets\n"
+        f"• Top 10 wallets own {coin.get('top10', 0):.0f}%{lp_txt}\n")
+    desc += (
+        "• No RugCheck danger flags\n\n"
+        f"**Exit plan:** stop-loss at **-{STOP_LOSS_PCT}%** · sell half at **+{TAKE_PROFIT_PCT}%**, let the rest ride with a stop at break-even\n\n"
+        f"**Why:** {explain(item, analysis)}\n"
+        f"**Story ({item['source']}):** {item['url']}\n"
+        f"[DexScreener]({coin['url']}) · [RugCheck](https://rugcheck.xyz/tokens/{coin['address']})\n"
+        "_Safety checks lower the odds of a rug, they don't remove them. Only use money you can afford to lose._")
     payload = {'allowed_mentions': {'parse': []}, 'embeds': [{
         'title': '🚨 ' + analysis['category'] + ': ' + title,
-        'url': item['url'],
-        'description': ('**Possible ticker idea:** `$' + analysis['ticker'] + '` (not an existing-token check)\n'
-                        '**Narrative:** ' + explain(item, analysis) + '\n'
-                        '**Source:** ' + item['source'] + ' · **Filter score:** ' + str(analysis['score']) + '/12+\n'
-                        '**Original post / article:** ' + item['url'] + '\n'
-                        '_Idea only. Not investment advice, and virality is not guaranteed._'),
-        'color': 0x27B6D8, 'timestamp': (item['date'] or NOW).isoformat()
-    }]}
+        'url': item['url'], 'description': desc[:4000],
+        'color': 0x2ECC71, 'timestamp': NOW.isoformat()}]}
     discord(payload)
 
 
@@ -235,7 +355,7 @@ def load_state():
 def scan():
     if os.getenv('TEST_ALERT') == '1':
         discord({'allowed_mentions': {'parse': []}, 'embeds': [{'title': '✅ Memecoin Radar V2 connected!',
-                'description': 'Your Discord webhook works. The scheduled scanner can now send filtered narrative leads.',
+                'description': 'Your Discord webhook works. V2.1: alerts now only fire when a REAL coin for the story passes safety checks (liquidity, volume, mint/freeze authority, holder concentration, LP lock, RugCheck).',
                 'color': 0x28A745}]})
         print('Test alert delivered.'); return
     # Require a real webhook before altering the repo state.
@@ -271,13 +391,25 @@ def scan():
         pending.append((meta['score'], item, meta, sig))
     pending.sort(key=lambda row: (row[0], row[1]['likes'] + 2*row[1]['reposts']), reverse=True)
     sent = 0
+    lookups = 0
+    skipped = 0
     picked = []
+    checked_tickers = {}
     for _, item, meta, sig in pending:
         if same_story(sig, known_topics + picked): continue
         picked.append(sig)
-        if virgin or sent >= MAX_ALERTS: continue
+        if virgin or sent >= MAX_ALERTS or lookups >= MAX_LOOKUPS: continue
+        ticker = meta['ticker']
+        if ticker not in checked_tickers:
+            lookups += 1
+            checked_tickers[ticker] = check_ticker(ticker)
+        coin, notes = checked_tickers[ticker]
+        if not coin:
+            skipped += 1
+            print('No safe coin for $' + ticker + ':', ' | '.join(notes)[:300])
+            continue
         try:
-            alert(item, meta)
+            alert(item, meta, coin)
             print('Alert sent:', meta['category'], item['url'])
             recent_topics.append({'words': sig, 'ts': NOW.timestamp()})
             sent += 1
@@ -292,7 +424,7 @@ def scan():
     # Limit stored hashes so a frequently scheduled public repo stays small.
     seen = dict(sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:1500])
     STATE_PATH.write_text(json.dumps({'seen': seen, 'topics': recent_topics[-150:]}, indent=2), encoding='utf-8')
-    print('Scan complete. Sources:', len(fetched), 'Candidates:', len(pending), 'Alerts:', sent)
+    print('Scan complete. Sources:', len(fetched), 'Candidates:', len(pending), 'Coin lookups:', lookups, 'Unsafe/none skipped:', skipped, 'Alerts:', sent)
 
 
 if __name__ == '__main__':
