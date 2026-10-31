@@ -35,6 +35,8 @@ jobs:
       - name: Scan free feeds and notify Discord
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          X_API_KEY: ${{ secrets.TWITTERAPI_KEY }}
+          X_INTERVAL_MIN: '15'
           TEST_ALERT: ${{ inputs.test_alert && '1' || '0' }}
           MIN_SCORE: '8'
           MAX_AGE_HOURS: '12'
